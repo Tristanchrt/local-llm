@@ -40,8 +40,8 @@ const COLLECTION_NAME = "documents";
 const qdrantClient = new QdrantClient({ url: QDRANT_URL });
 const embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { quantized: true });
 
-// --- Limiter pour condensation (LLM non-streaming) ---
-const condenseLimit = pLimit(5);
+// --- Limiter pour les appels Ollama ---
+const ollamaLimit = pLimit(5);
 
 // --- Cosine similarity ---
 function cosineSimilarity(a: number[], b: number[]) {
@@ -83,7 +83,7 @@ async function condenseChunks(chunks: { text: string, source?: string }[], log: 
     log(`Condensation skipped for ${chunks.length} chunks`);
     return chunks.map(c => `Source ${c.source}:\n${c.text}`).join("\n\n");
   }
-  return condenseLimit(async () => {
+  return ollamaLimit(async () => {
     const start = Date.now();
     const prompt = `
       Résume les extraits suivants en un texte concis et clair,
@@ -157,11 +157,11 @@ app.get("/query", async (req, res) => {
 
     // --- Streaming concurrent direct ---
     const startOllama = Date.now();
-    const stream = await ollama.chat({
+    const stream = await ollamaLimit(() => ollama.chat({
       model: process.env.OLLAMA_MODEL || "llama2:7b",
       messages: [{ role: "user", content: prompt }],
       stream: true,
-    });
+    }));
 
     let firstChunk = true;
     for await (const chunk of stream) {
@@ -171,6 +171,7 @@ app.get("/query", async (req, res) => {
       }
       if (chunk.message?.content) {
         res.write(`data: ${chunk.message.content}\n\n`);
+        await new Promise(resolve => setImmediate(resolve)); 
       }
     }
     log(`Full LLM response stream took ${Date.now() - startOllama}ms`);
