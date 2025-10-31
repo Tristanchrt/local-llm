@@ -1,0 +1,11 @@
+langchain
+langchain-ollama
+langchain-huggingface
+langchain-qdrant
+langchain_classic
+langchain-community
+fastapi
+uvicorn
+qdrant-client
+sentence-transformers
+requests
