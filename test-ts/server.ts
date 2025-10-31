@@ -1,45 +1,47 @@
 import express from "express";
 import dotenv from "dotenv";
-import ollama from "ollama"; // client direct
+import ollama from "ollama";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import { pipeline } from "@xenova/transformers";
 import bodyParser from "body-parser";
 import crypto from "crypto";
+import pLimit from "p-limit";
 
 dotenv.config();
 const app = express();
 app.use(bodyParser.json());
 
-// Middleware pour ajouter un ID de requête unique
+// --- Middleware pour ID de requête ---
 app.use((req, res, next) => {
   (req as any).id = crypto.randomUUID();
   next();
 });
 
-// Middleware pour logger les requêtes
+// --- Middleware logs ---
 app.use((req, res, next) => {
   const start = Date.now();
   const requestId = (req as any).id;
   res.on("finish", () => {
     const duration = Date.now() - start;
-    console.log(
-      `[${new Date().toISOString()}] [${requestId}] ${req.method} ${
-        req.originalUrl
-      } ${res.statusCode} - ${duration}ms`
-    );
+    console.log(`[${new Date().toISOString()}] [${requestId}] ${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
   });
   next();
 });
 
-const PORT = process.env.PORT || 3000;
+const createLogger = (requestId?: string) => (message: string) => {
+  const base = `[${new Date().toISOString()}]`;
+  const reqIdPart = requestId ? ` [${requestId}]` : "";
+  console.log(`${base}${reqIdPart} ${message}`);
+};
 
-// --- Qdrant config ---
-const QDRANT_URL = "http://localhost:6333";
+const PORT = process.env.PORT || 3000;
+const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
 const COLLECTION_NAME = "documents";
 const qdrantClient = new QdrantClient({ url: QDRANT_URL });
-
-// --- Embeddings ---
 const embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", { quantized: true });
+
+// --- Limiter pour condensation (LLM non-streaming) ---
+const condenseLimit = pLimit(5);
 
 // --- Cosine similarity ---
 function cosineSimilarity(a: number[], b: number[]) {
@@ -51,9 +53,11 @@ function cosineSimilarity(a: number[], b: number[]) {
 }
 
 // --- Embed query ---
-async function embedQuery(text: string): Promise<number[] | null> {
+async function embedQuery(text: string, log: (message: string) => void = console.log): Promise<number[] | null> {
   try {
+    const start = Date.now();
     const result = await embedder(text, { pooling: "mean", normalize: true });
+    log(`Embedding took ${Date.now() - start}ms`);
     return result?.data ? Array.from(result.data) : null;
   } catch (e) {
     console.error("Error embedding query:", e);
@@ -62,72 +66,60 @@ async function embedQuery(text: string): Promise<number[] | null> {
 }
 
 // --- Reranking ---
-function rerankChunks(questionVector: number[], chunks: any[], topK = 5) {
-  const validChunks = chunks.filter(c => c.vector && c.vector.length === questionVector.length)
-    .map(c => ({
-      ...c,
-      score: cosineSimilarity(questionVector, c.vector),
-    }));
+function rerankChunks(questionVector: number[], chunks: any[], topK = 5, log: (message: string) => void = console.log) {
+  const start = Date.now();
+  const validChunks = chunks
+    .filter(c => c.vector && c.vector.length === questionVector.length)
+    .map(c => ({ ...c, score: cosineSimilarity(questionVector, c.vector) }));
   validChunks.sort((a, b) => b.score - a.score);
-  return validChunks.slice(0, topK);
+  const result = validChunks.slice(0, topK);
+  log(`Reranking took ${Date.now() - start}ms`);
+  return result;
 }
 
-// --- Condensation si trop de chunks ---
-async function condenseChunks(chunks: { text: string, source?: string }[]): Promise<string> {
+// --- Condensation ---
+async function condenseChunks(chunks: { text: string, source?: string }[], log: (message: string) => void): Promise<string> {
   if (chunks.length <= 5) {
+    log(`Condensation skipped for ${chunks.length} chunks`);
     return chunks.map(c => `Source ${c.source}:\n${c.text}`).join("\n\n");
   }
+  return condenseLimit(async () => {
+    const start = Date.now();
+    const prompt = `
+      Résume les extraits suivants en un texte concis et clair,
+      en gardant les informations importantes et en citant les sources.
 
-  const prompt = `
-    Résume les extraits suivants en un texte concis et clair,
-    en gardant les informations importantes et en citant les sources.
+      ${chunks.map(c => `Source ${c.source}:\n${c.text}`).join("\n\n")}
 
-    ${chunks.map(c => `Source ${c.source}:\n${c.text}`).join("\n\n")}
-
-    Résumé :
-  `;
-
-  const response = await ollama.chat({
-    model: process.env.OLLAMA_MODEL || "llama2:7b",
-    messages: [{ role: "user", content: prompt }],
+      Résumé :
+    `;
+    const response = await ollama.chat({
+      model: process.env.OLLAMA_MODEL || "llama2:7b",
+      messages: [{ role: "user", content: prompt }],
+    });
+    log(`Condensation with LLM took ${Date.now() - start}ms`);
+    return response.message.content;
   });
-
-  return response.message.content;
 }
 
-// --- Récupération des documents ---
-async function getTopKDocuments(requestId: string, question: string, topK = 5) {
-  console.time(`[${requestId}] getTopKDocuments`);
-  console.time(`[${requestId}] embedQuery`);
-  const vector = await embedQuery(question);
-  console.timeEnd(`[${requestId}] embedQuery`);
-  if (!vector) {
-    console.timeEnd(`[${requestId}] getTopKDocuments`);
-    return [];
-  }
+// --- TopK documents ---
+async function getTopKDocuments(question: string, topK = 5, log: (message: string) => void = console.log) {
+  const vector = await embedQuery(question, log);
+  if (!vector) return "";
 
-  // Recherche initiale
-  console.time(`[${requestId}] Qdrant search`);
+  const start = Date.now();
   const searchResult = await qdrantClient.search(COLLECTION_NAME, {
     vector,
     limit: 20,
     with_vector: true,
   });
-  console.timeEnd(`[${requestId}] Qdrant search`);
+  log(`Qdrant search took ${Date.now() - start}ms`);
 
-  // Reranking
-  console.time(`[${requestId}] Reranking`);
-  const reranked = rerankChunks(vector, searchResult, topK);
-  console.timeEnd(`[${requestId}] Reranking`);
-
-  // Condensation
-  console.time(`[${requestId}] Condensation`);
+  const reranked = rerankChunks(vector, searchResult, topK, log);
   const context = await condenseChunks(
-    reranked.map((r) => ({ text: r.payload.text, source: r.payload.source }))
+    reranked.map(r => ({ text: r.payload.text, source: r.payload.source })),
+    log
   );
-  console.timeEnd(`[${requestId}] Condensation`);
-  console.timeEnd(`[${requestId}] getTopKDocuments`);
-
   return context;
 }
 
@@ -135,11 +127,14 @@ async function getTopKDocuments(requestId: string, question: string, topK = 5) {
 app.get("/query", async (req, res) => {
   const question = req.query.q as string;
   const requestId = (req as any).id;
-  if (!question)
-    return res.status(400).json({ error: "Missing query parameter 'q'" });
+  const log = createLogger(requestId);
+
+  if (!question) return res.status(400).json({ error: "Missing query parameter 'q'" });
 
   try {
-    const context = await getTopKDocuments(requestId, question);
+    const startContext = Date.now();
+    const context = await getTopKDocuments(question, 5, log);
+    log(`Context retrieval took ${Date.now() - startContext}ms`);
 
     const prompt = `
       Tu es un assistant expert.
@@ -160,20 +155,25 @@ app.get("/query", async (req, res) => {
     res.setHeader("Cache-Control", "no-cache");
     res.flushHeaders();
 
-    console.time(`[${requestId}] ollama.chat stream`);
+    // --- Streaming concurrent direct ---
+    const startOllama = Date.now();
     const stream = await ollama.chat({
       model: process.env.OLLAMA_MODEL || "llama2:7b",
       messages: [{ role: "user", content: prompt }],
       stream: true,
     });
-    console.timeEnd(`[${requestId}] ollama.chat stream`);
 
+    let firstChunk = true;
     for await (const chunk of stream) {
+      if (firstChunk) {
+        log(`Time to first chunk from LLM: ${Date.now() - startOllama}ms`);
+        firstChunk = false;
+      }
       if (chunk.message?.content) {
         res.write(`data: ${chunk.message.content}\n\n`);
       }
     }
-    console.timeEnd(`[${requestId}] ollama.chat stream`);
+    log(`Full LLM response stream took ${Date.now() - startOllama}ms`);
 
     res.write("event: end\ndata: \n\n");
     res.end();
