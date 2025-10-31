@@ -8,7 +8,6 @@ import pLimit from "p-limit";
 
 dotenv.config();
 
-// --- CONFIG ---
 const DATA_DIR = "./data";
 const HASH_DB_PATH = "./hashes.json";
 const QDRANT_URL = process.env.QDRANT_URL || "http://localhost:6333";
@@ -17,18 +16,15 @@ const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "Xenova/all-MiniLM-L6-v2"
 const BATCH_SIZE = parseInt(process.env.QDRANT_BATCH_SIZE || "64", 10);
 const CONCURRENCY = parseInt(process.env.CONCURRENCY || "4", 10);
 
-// --- HELPER: Charger le hash DB existant ---
 async function loadHashDb(): Promise<Record<string, string>> {
   try {
     const data = await fs.readFile(HASH_DB_PATH, "utf-8");
     return JSON.parse(data);
   } catch (error) {
-    // Si le fichier n'existe pas ou est vide
     return {};
   }
 }
 
-// --- HELPER: Initialiser Qdrant ---
 async function initializeQdrant(client: QdrantClient) {
   const collections = (await client.getCollections()).collections.map(c => c.name);
   if (!collections.includes(COLLECTION_NAME)) {
@@ -58,23 +54,23 @@ async function embedText(
   }
 }
 
-// --- HELPER: Split text into chunks ---
-function splitText(text: string, chunkSize = 500, overlap = 50): string[] {
-  const chunks: string[] = [];
-  if (!text) return chunks;
-
-  let start = 0;
-  while (start < text.length) {
-    const end = Math.min(start + chunkSize, text.length);
-    const chunk = text.slice(start, end);
-    chunks.push(chunk);
-    start += chunkSize - overlap;
+function splitTextSemantic(text: string, maxChunkLength = 500) {
+    const paragraphs = text.split(/\n\n+/);
+    const chunks: string[] = [];
+    let chunk = "";
+  
+    for (const p of paragraphs) {
+      if ((chunk + p).length > maxChunkLength) {
+        if (chunk) chunks.push(chunk.trim());
+        chunk = p;
+      } else {
+        chunk += " " + p;
+      }
+    }
+    if (chunk) chunks.push(chunk.trim());
+    return chunks;
   }
-  return chunks;
-}
 
-
-// --- Main function ---
 async function main() {
   console.log(`Using model: "${EMBEDDING_MODEL}".`);
 
@@ -85,7 +81,6 @@ async function main() {
   
   await initializeQdrant(qdrantClient);
 
-  // Initialize embedder
   const embedder = await pipeline("feature-extraction", EMBEDDING_MODEL, { quantized: true });
 
   const allDocs: { id: string; vector: number[]; payload: any }[] = [];
@@ -101,7 +96,7 @@ async function main() {
     console.log(`📄 Processing ${filename}...`);
     
     const text = await fs.readFile(filePath, "utf-8");
-    const chunks = splitText(text);
+    const chunks = splitTextSemantic(text);
 
     const chunkPromises = chunks.map(chunk => limit(async () => {
       if (!chunk.trim()) return; // Skip empty chunks
@@ -118,9 +113,15 @@ async function main() {
       allDocs.push({
         id: hash,
         vector,
-        payload: { text: chunk, source: filename },
+        payload: {
+          text: chunk,
+          title: filename.replace(".md", ""),
+          tags: ["cron", "architecture"],
+          source: filename,
+          paragraphIndex: chunks.indexOf(chunk),
+        },
       });
-
+      
       hashDb[hash] = filename;
     }));
 
